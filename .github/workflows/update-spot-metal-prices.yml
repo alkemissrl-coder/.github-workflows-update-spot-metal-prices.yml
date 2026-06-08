@@ -5,60 +5,65 @@ permissions:
 
 on:
   schedule:
+    # Ogni 30 minuti: minuti :07 e :37.
+    # GitHub interpreta il cron in UTC, ma per un intervallo ogni 30 minuti
+    # non cambia nulla. L'orario italiano viene scritto nel CSV da Python.
     - cron: "7,37 * * * *"
   workflow_dispatch:
 
 concurrency:
   group: update-spot-metal-prices
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   update:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
+    env:
+      METAL_API_KEY: ${{ secrets.METAL_PRICE_API_KEY }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPOSITORY: ${{ github.repository }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      OUTPUT_FILE: spot_metal_prices.csv
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install dependencies
+      - name: Fetch spot prices and update CSV
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
-          pip install requests
-
-      - name: Fetch API and update spot CSV
-        env:
-          API_KEY: ${{ secrets.METAL_PRICE_API_KEY }}
-          PYTHONUNBUFFERED: "1"
-          TZ: "Europe/Rome"
-        run: |
-          python << 'PYTHON_SCRIPT'
+          python3 << 'PYTHON_SCRIPT'
+          import base64
           import csv
+          import io
+          import json
           import os
           import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
           from datetime import datetime
           from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-          from pathlib import Path
           from zoneinfo import ZoneInfo
 
-          import requests
 
-          API_KEY = os.environ.get("API_KEY")
-          BASE_URL = "https://api.metalpriceapi.com/v1/latest"
-          OUTPUT_CSV = Path("spot_metal_prices.csv")
+          METAL_API_KEY = os.environ.get("METAL_API_KEY")
+          GH_TOKEN = os.environ.get("GH_TOKEN")
+          GH_REPOSITORY = os.environ.get("GH_REPOSITORY")
+          DEFAULT_BRANCH = os.environ.get("DEFAULT_BRANCH") or "main"
+          OUTPUT_FILE = os.environ.get("OUTPUT_FILE") or "spot_metal_prices.csv"
+
+          METAL_API_URL = "https://api.metalpriceapi.com/v1/latest"
+          GITHUB_API_URL = f"https://api.github.com/repos/{GH_REPOSITORY}/contents/{OUTPUT_FILE}"
+
           OZ_TO_G = Decimal("31.1035")
           CSV_FIELDS = ["datetime", "gold_eur_per_g", "silver_eur_per_g"]
+
 
           def fail(message):
               print(f"ERROR: {message}", file=sys.stderr)
               sys.exit(1)
+
 
           def to_decimal(value, label):
               try:
@@ -66,46 +71,87 @@ jobs:
               except (InvalidOperation, TypeError):
                   fail(f"Invalid decimal value for {label}: {value!r}")
 
-          def fetch_rates():
-              if not API_KEY:
-                  fail("METAL_PRICE_API_KEY secret is missing or empty.")
 
-              params = {
-                  "api_key": API_KEY,
+          def http_json_request(url, method="GET", headers=None, body=None):
+              request = urllib.request.Request(
+                  url=url,
+                  method=method,
+                  headers=headers or {},
+                  data=body,
+              )
+
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      raw = response.read().decode("utf-8")
+                      if not raw:
+                          return None, response.status
+                      return json.loads(raw), response.status
+
+              except urllib.error.HTTPError as error:
+                  raw = error.read().decode("utf-8", errors="replace")
+                  try:
+                      parsed = json.loads(raw)
+                  except json.JSONDecodeError:
+                      parsed = raw
+
+                  return {
+                      "_http_error": True,
+                      "status": error.code,
+                      "body": parsed,
+                  }, error.code
+
+              except urllib.error.URLError as error:
+                  fail(f"Network error during HTTP request: {error}")
+
+
+          def fetch_metal_rates():
+              if not METAL_API_KEY:
+                  fail("Missing repository secret METAL_PRICE_API_KEY.")
+
+              query = urllib.parse.urlencode({
+                  "api_key": METAL_API_KEY,
                   "base": "USD",
                   "currencies": "EUR,XAU,XAG",
-              }
+              })
+
+              url = f"{METAL_API_URL}?{query}"
 
               print("Calling Metal Price API...")
-              response = requests.get(BASE_URL, params=params, timeout=20)
-              print(f"HTTP status: {response.status_code}")
+              data, status = http_json_request(url)
 
-              if response.status_code != 200:
-                  print("API response body:")
-                  print(response.text[:1000])
-                  response.raise_for_status()
+              print(f"Metal Price API HTTP status: {status}")
 
-              data = response.json()
-              print("API success:", data.get("success"))
-              print("API base:", data.get("base"))
+              if status != 200:
+                  print("Metal Price API response:")
+                  print(data)
+                  fail("Metal Price API request failed.")
+
+              print("Metal Price API success:", data.get("success"))
+              print("Metal Price API base:", data.get("base"))
 
               if not data.get("success"):
-                  print("API response body:")
+                  print("Metal Price API response:")
                   print(data)
                   fail("Metal Price API returned success=false.")
 
               rates = data.get("rates")
+
               if not isinstance(rates, dict):
-                  print("API response body:")
+                  print("Metal Price API response:")
                   print(data)
-                  fail("API response does not contain a valid rates object.")
+                  fail("Metal Price API response does not contain a valid rates object.")
 
               for key in ["EUR", "XAU", "XAG"]:
                   if key not in rates:
-                      print("Available rate keys:", ", ".join(sorted(rates.keys())))
-                      fail(f"Missing {key} in API response.")
+                      print("Available rate keys:", sorted(rates.keys()))
+                      fail(f"Missing {key} in Metal Price API response.")
+
+              print("Raw EUR:", rates["EUR"])
+              print("Raw XAU:", rates["XAU"])
+              print("Raw XAG:", rates["XAG"])
 
               return rates
+
 
           def metal_eur_per_gram(rates, metal_code):
               eur_per_usd = to_decimal(rates["EUR"], "EUR")
@@ -113,6 +159,7 @@ jobs:
 
               if eur_per_usd <= 0:
                   fail("EUR rate must be greater than zero.")
+
               if metal_oz_per_usd <= 0:
                   fail(f"{metal_code} rate must be greater than zero.")
 
@@ -130,20 +177,26 @@ jobs:
 
               return eur_per_g
 
-          rates = fetch_rates()
 
-          now = datetime.now(ZoneInfo("Europe/Rome")).replace(second=0, microsecond=0)
-          datetime_str = now.strftime("%Y-%m-%d %H:%M:%S")
+          def sanity_check(gold_eur_per_g, silver_eur_per_g):
+              # Range volutamente larghi.
+              # Servono a bloccare errori grossolani di inversione cambio/API.
+              if not Decimal("10") <= gold_eur_per_g <= Decimal("300"):
+                  fail(f"Gold EUR/g value looks abnormal: {gold_eur_per_g}")
 
-          gold_eur_per_g = metal_eur_per_gram(rates, "XAU")
-          silver_eur_per_g = metal_eur_per_gram(rates, "XAG")
+              if not Decimal("0.1") <= silver_eur_per_g <= Decimal("20"):
+                  fail(f"Silver EUR/g value looks abnormal: {silver_eur_per_g}")
 
-          print(f"Datetime Europe/Rome: {datetime_str}")
-          print(f"Final gold EUR/g: {gold_eur_per_g}")
-          print(f"Final silver EUR/g: {silver_eur_per_g}")
 
-          with OUTPUT_CSV.open("w", encoding="utf-8", newline="") as file:
-              writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
+          def build_csv(datetime_str, gold_eur_per_g, silver_eur_per_g):
+              buffer = io.StringIO()
+
+              writer = csv.DictWriter(
+                  buffer,
+                  fieldnames=CSV_FIELDS,
+                  lineterminator="\n",
+              )
+
               writer.writeheader()
               writer.writerow({
                   "datetime": datetime_str,
@@ -151,41 +204,142 @@ jobs:
                   "silver_eur_per_g": str(silver_eur_per_g),
               })
 
-          print("spot_metal_prices.csv updated successfully.")
+              return buffer.getvalue()
+
+
+          def github_headers():
+              if not GH_TOKEN:
+                  fail("Missing GitHub token.")
+
+              return {
+                  "Authorization": f"Bearer {GH_TOKEN}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "Content-Type": "application/json",
+                  "User-Agent": "spot-metal-prices-updater",
+              }
+
+
+          def get_existing_file():
+              url = f"{GITHUB_API_URL}?ref={urllib.parse.quote(DEFAULT_BRANCH)}"
+
+              data, status = http_json_request(
+                  url,
+                  method="GET",
+                  headers=github_headers(),
+              )
+
+              if status == 404:
+                  print(f"{OUTPUT_FILE} does not exist yet. It will be created.")
+                  return None, None
+
+              if status != 200:
+                  print("GitHub API response while reading file:")
+                  print(data)
+                  fail(f"Could not read {OUTPUT_FILE} from GitHub.")
+
+              sha = data.get("sha")
+              encoded_content = data.get("content", "")
+              encoding = data.get("encoding")
+
+              existing_text = None
+
+              if encoded_content and encoding == "base64":
+                  compact_content = encoded_content.replace("\n", "")
+                  existing_text = base64.b64decode(compact_content).decode("utf-8")
+
+              return sha, existing_text
+
+
+          def put_file(csv_text, sha):
+              payload = {
+                  "message": "Update spot metal prices",
+                  "content": base64.b64encode(csv_text.encode("utf-8")).decode("ascii"),
+                  "branch": DEFAULT_BRANCH,
+              }
+
+              # GitHub richiede lo sha quando si aggiorna un file già esistente.
+              if sha:
+                  payload["sha"] = sha
+
+              body = json.dumps(payload).encode("utf-8")
+
+              data, status = http_json_request(
+                  GITHUB_API_URL,
+                  method="PUT",
+                  headers=github_headers(),
+                  body=body,
+              )
+
+              return data, status
+
+
+          def update_csv_on_github(csv_text):
+              for attempt in range(1, 6):
+                  print(f"GitHub file update attempt {attempt}/5...")
+
+                  sha, existing_text = get_existing_file()
+
+                  if existing_text == csv_text:
+                      print(f"{OUTPUT_FILE} is already up to date. No commit needed.")
+                      return
+
+                  data, status = put_file(csv_text, sha)
+
+                  if status in (200, 201):
+                      commit_sha = None
+
+                      if isinstance(data, dict):
+                          commit_sha = data.get("commit", {}).get("sha")
+
+                      print(f"{OUTPUT_FILE} updated successfully.")
+                      print(f"Commit SHA: {commit_sha}")
+                      return
+
+                  if status == 409:
+                      print("GitHub API conflict detected. Retrying with latest file SHA...")
+                      time.sleep(2)
+                      continue
+
+                  print("GitHub API response while updating file:")
+                  print(data)
+                  fail(f"Could not update {OUTPUT_FILE}. HTTP status: {status}")
+
+              fail(f"Could not update {OUTPUT_FILE} after 5 attempts.")
+
+
+          def main():
+              print(f"Repository: {GH_REPOSITORY}")
+              print(f"Branch: {DEFAULT_BRANCH}")
+              print(f"Output file: {OUTPUT_FILE}")
+
+              rates = fetch_metal_rates()
+
+              gold_eur_per_g = metal_eur_per_gram(rates, "XAU")
+              silver_eur_per_g = metal_eur_per_gram(rates, "XAG")
+
+              sanity_check(gold_eur_per_g, silver_eur_per_g)
+
+              now_rome = datetime.now(ZoneInfo("Europe/Rome")).replace(
+                  second=0,
+                  microsecond=0,
+              )
+
+              datetime_str = now_rome.strftime("%Y-%m-%d %H:%M:%S")
+
+              csv_text = build_csv(
+                  datetime_str=datetime_str,
+                  gold_eur_per_g=gold_eur_per_g,
+                  silver_eur_per_g=silver_eur_per_g,
+              )
+
+              print("")
+              print("Generated CSV:")
+              print(csv_text)
+
+              update_csv_on_github(csv_text)
+
+
+          if __name__ == "__main__":
+              main()
           PYTHON_SCRIPT
-
-      - name: Show generated CSV
-        run: |
-          echo "Generated CSV:"
-          cat spot_metal_prices.csv
-
-      - name: Commit latest generated CSV safely
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          echo "Save generated CSV outside repo..."
-          cp spot_metal_prices.csv /tmp/spot_metal_prices.csv
-
-          echo "Reset working tree to latest origin/main..."
-          git fetch origin main
-          git reset --hard origin/main
-
-          echo "Restore generated CSV..."
-          cp /tmp/spot_metal_prices.csv spot_metal_prices.csv
-
-          echo "Git status:"
-          git status --short
-
-          git add spot_metal_prices.csv
-
-          echo "Staged diff:"
-          git diff --cached -- spot_metal_prices.csv || true
-
-          if git diff --cached --quiet; then
-            echo "No CSV changes to commit."
-            exit 0
-          fi
-
-          git commit -m "Update spot metal prices"
-          git push origin HEAD:main
