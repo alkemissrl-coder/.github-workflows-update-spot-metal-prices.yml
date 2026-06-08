@@ -23,12 +23,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Sync with latest remote before editing CSV
-        run: |
-          git fetch origin main
-          git checkout main
-          git reset --hard origin/main
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -58,15 +52,9 @@ jobs:
 
           API_KEY = os.environ.get("API_KEY")
           BASE_URL = "https://api.metalpriceapi.com/v1/latest"
-
           OUTPUT_CSV = Path("spot_metal_prices.csv")
           OZ_TO_G = Decimal("31.1035")
-
-          CSV_FIELDS = [
-              "datetime",
-              "gold_eur_per_g",
-              "silver_eur_per_g",
-          ]
+          CSV_FIELDS = ["datetime", "gold_eur_per_g", "silver_eur_per_g"]
 
           def fail(message):
               print(f"ERROR: {message}", file=sys.stderr)
@@ -90,7 +78,6 @@ jobs:
 
               print("Calling Metal Price API...")
               response = requests.get(BASE_URL, params=params, timeout=20)
-
               print(f"HTTP status: {response.status_code}")
 
               if response.status_code != 200:
@@ -99,7 +86,6 @@ jobs:
                   response.raise_for_status()
 
               data = response.json()
-
               print("API success:", data.get("success"))
               print("API base:", data.get("base"))
 
@@ -119,10 +105,6 @@ jobs:
                       print("Available rate keys:", ", ".join(sorted(rates.keys())))
                       fail(f"Missing {key} in API response.")
 
-              print("Raw EUR:", rates["EUR"])
-              print("Raw XAU:", rates["XAU"])
-              print("Raw XAG:", rates["XAG"])
-
               return rates
 
           def metal_eur_per_gram(rates, metal_code):
@@ -131,12 +113,12 @@ jobs:
 
               if eur_per_usd <= 0:
                   fail("EUR rate must be greater than zero.")
-
               if metal_oz_per_usd <= 0:
                   fail(f"{metal_code} rate must be greater than zero.")
 
               usd_per_oz = Decimal("1") / metal_oz_per_usd
               eur_per_oz = usd_per_oz * eur_per_usd
+
               eur_per_g = (eur_per_oz / OZ_TO_G).quantize(
                   Decimal("0.0001"),
                   rounding=ROUND_HALF_UP,
@@ -148,46 +130,52 @@ jobs:
 
               return eur_per_g
 
-          def write_spot_csv(datetime_str, gold_value, silver_value):
-              with OUTPUT_CSV.open("w", encoding="utf-8", newline="") as file:
-                  writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
-                  writer.writeheader()
-                  writer.writerow({
-                      "datetime": datetime_str,
-                      "gold_eur_per_g": str(gold_value),
-                      "silver_eur_per_g": str(silver_value),
-                  })
+          rates = fetch_rates()
 
-          def main():
-              rates = fetch_rates()
+          now = datetime.now(ZoneInfo("Europe/Rome")).replace(second=0, microsecond=0)
+          datetime_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
-              now = datetime.now(ZoneInfo("Europe/Rome")).replace(second=0, microsecond=0)
-              datetime_str = now.strftime("%Y-%m-%d %H:%M:%S")
+          gold_eur_per_g = metal_eur_per_gram(rates, "XAU")
+          silver_eur_per_g = metal_eur_per_gram(rates, "XAG")
 
-              gold_eur_per_g = metal_eur_per_gram(rates, "XAU")
-              silver_eur_per_g = metal_eur_per_gram(rates, "XAG")
+          print(f"Datetime Europe/Rome: {datetime_str}")
+          print(f"Final gold EUR/g: {gold_eur_per_g}")
+          print(f"Final silver EUR/g: {silver_eur_per_g}")
 
-              print(f"Datetime Europe/Rome: {datetime_str}")
-              print(f"Final gold EUR/g: {gold_eur_per_g}")
-              print(f"Final silver EUR/g: {silver_eur_per_g}")
+          with OUTPUT_CSV.open("w", encoding="utf-8", newline="") as file:
+              writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
+              writer.writeheader()
+              writer.writerow({
+                  "datetime": datetime_str,
+                  "gold_eur_per_g": str(gold_eur_per_g),
+                  "silver_eur_per_g": str(silver_eur_per_g),
+              })
 
-              write_spot_csv(datetime_str, gold_eur_per_g, silver_eur_per_g)
-
-              print(f"{OUTPUT_CSV} updated successfully.")
-
-          if __name__ == "__main__":
-              main()
+          print("spot_metal_prices.csv updated successfully.")
           PYTHON_SCRIPT
 
       - name: Show generated CSV
         run: |
-          echo "spot_metal_prices.csv:"
-          cat spot_metal_prices.csv || true
+          echo "Generated CSV:"
+          cat spot_metal_prices.csv
 
-      - name: Commit and push if changed
+      - name: Commit latest generated CSV safely
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          echo "Save generated CSV outside repo..."
+          cp spot_metal_prices.csv /tmp/spot_metal_prices.csv
+
+          echo "Reset working tree to latest origin/main..."
+          git fetch origin main
+          git reset --hard origin/main
+
+          echo "Restore generated CSV..."
+          cp /tmp/spot_metal_prices.csv spot_metal_prices.csv
+
+          echo "Git status:"
+          git status --short
 
           git add spot_metal_prices.csv
 
@@ -196,7 +184,8 @@ jobs:
 
           if git diff --cached --quiet; then
             echo "No CSV changes to commit."
-          else
-            git commit -m "Update spot metal prices"
-            git push origin main
+            exit 0
           fi
+
+          git commit -m "Update spot metal prices"
+          git push origin HEAD:main
