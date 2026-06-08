@@ -24,6 +24,10 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Sync with latest remote
+        run: |
+          git pull --ff-only origin main
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -201,10 +205,5 @@ jobs:
             echo "No CSV changes to commit."
           else
             git commit -m "Update spot metal prices"
-
-            echo "Pull latest remote changes before push..."
-            git pull --rebase origin main
-
-            echo "Push changes..."
             git push origin main
           fi
