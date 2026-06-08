@@ -200,5 +200,10 @@ jobs:
             echo "No CSV changes to commit."
           else
             git commit -m "Update spot metal prices"
-            git push
+
+            echo "Pull latest remote changes before push..."
+            git pull --rebase origin main
+
+            echo "Push changes..."
+            git push origin main
           fi
