@@ -5,7 +5,6 @@ permissions:
 
 on:
   schedule:
-    # Ogni 30 minuti, ai minuti 7 e 37 UTC
     - cron: "7,37 * * * *"
   workflow_dispatch:
 
@@ -24,9 +23,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Sync with latest remote
+      - name: Sync with latest remote before editing CSV
         run: |
-          git pull --ff-only origin main
+          git fetch origin main
+          git checkout main
+          git reset --hard origin/main
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -55,7 +56,6 @@ jobs:
 
           import requests
 
-
           API_KEY = os.environ.get("API_KEY")
           BASE_URL = "https://api.metalpriceapi.com/v1/latest"
 
@@ -68,18 +68,15 @@ jobs:
               "silver_eur_per_g",
           ]
 
-
           def fail(message):
               print(f"ERROR: {message}", file=sys.stderr)
               sys.exit(1)
-
 
           def to_decimal(value, label):
               try:
                   return Decimal(str(value))
               except (InvalidOperation, TypeError):
                   fail(f"Invalid decimal value for {label}: {value!r}")
-
 
           def fetch_rates():
               if not API_KEY:
@@ -128,7 +125,6 @@ jobs:
 
               return rates
 
-
           def metal_eur_per_gram(rates, metal_code):
               eur_per_usd = to_decimal(rates["EUR"], "EUR")
               metal_oz_per_usd = to_decimal(rates[metal_code], metal_code)
@@ -152,7 +148,6 @@ jobs:
 
               return eur_per_g
 
-
           def write_spot_csv(datetime_str, gold_value, silver_value):
               with OUTPUT_CSV.open("w", encoding="utf-8", newline="") as file:
                   writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
@@ -162,7 +157,6 @@ jobs:
                       "gold_eur_per_g": str(gold_value),
                       "silver_eur_per_g": str(silver_value),
                   })
-
 
           def main():
               rates = fetch_rates()
@@ -180,7 +174,6 @@ jobs:
               write_spot_csv(datetime_str, gold_eur_per_g, silver_eur_per_g)
 
               print(f"{OUTPUT_CSV} updated successfully.")
-
 
           if __name__ == "__main__":
               main()
