@@ -6,8 +6,7 @@ permissions:
 on:
   schedule:
     # Ogni 30 minuti: minuti :07 e :37.
-    # GitHub interpreta il cron in UTC, ma per un intervallo ogni 30 minuti
-    # non cambia nulla. L'orario italiano viene scritto nel CSV da Python.
+    # GitHub interpreta il cron in UTC. L'orario italiano viene scritto nel CSV da Python.
     - cron: "7,37 * * * *"
   workflow_dispatch:
 
@@ -28,6 +27,12 @@ jobs:
       OUTPUT_FILE: spot_metal_prices.csv
 
     steps:
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install requests
+
       - name: Fetch spot prices and update CSV
         shell: bash
         run: |
@@ -45,6 +50,8 @@ jobs:
           from datetime import datetime
           from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
           from zoneinfo import ZoneInfo
+
+          import requests
 
 
           METAL_API_KEY = os.environ.get("METAL_API_KEY")
@@ -72,59 +79,46 @@ jobs:
                   fail(f"Invalid decimal value for {label}: {value!r}")
 
 
-          def http_json_request(url, method="GET", headers=None, body=None):
-              request = urllib.request.Request(
-                  url=url,
-                  method=method,
-                  headers=headers or {},
-                  data=body,
-              )
-
-              try:
-                  with urllib.request.urlopen(request, timeout=30) as response:
-                      raw = response.read().decode("utf-8")
-                      if not raw:
-                          return None, response.status
-                      return json.loads(raw), response.status
-
-              except urllib.error.HTTPError as error:
-                  raw = error.read().decode("utf-8", errors="replace")
-                  try:
-                      parsed = json.loads(raw)
-                  except json.JSONDecodeError:
-                      parsed = raw
-
-                  return {
-                      "_http_error": True,
-                      "status": error.code,
-                      "body": parsed,
-                  }, error.code
-
-              except urllib.error.URLError as error:
-                  fail(f"Network error during HTTP request: {error}")
-
-
           def fetch_metal_rates():
               if not METAL_API_KEY:
                   fail("Missing repository secret METAL_PRICE_API_KEY.")
 
-              query = urllib.parse.urlencode({
+              params = {
                   "api_key": METAL_API_KEY,
                   "base": "USD",
                   "currencies": "EUR,XAU,XAG",
-              })
+              }
 
-              url = f"{METAL_API_URL}?{query}"
+              headers = {
+                  "User-Agent": "Mozilla/5.0 (compatible; GitHubActionsMetalPrices/1.0)",
+                  "Accept": "application/json,text/plain,*/*",
+                  "Connection": "close",
+              }
 
               print("Calling Metal Price API...")
-              data, status = http_json_request(url)
+              response = requests.get(
+                  METAL_API_URL,
+                  params=params,
+                  headers=headers,
+                  timeout=30,
+              )
 
-              print(f"Metal Price API HTTP status: {status}")
+              print(f"Metal Price API HTTP status: {response.status_code}")
 
-              if status != 200:
+              try:
+                  data = response.json()
+              except ValueError:
+                  data = response.text
+
+              if response.status_code != 200:
                   print("Metal Price API response:")
                   print(data)
                   fail("Metal Price API request failed.")
+
+              if not isinstance(data, dict):
+                  print("Metal Price API response:")
+                  print(data)
+                  fail("Metal Price API did not return JSON object.")
 
               print("Metal Price API success:", data.get("success"))
               print("Metal Price API base:", data.get("base"))
@@ -179,8 +173,6 @@ jobs:
 
 
           def sanity_check(gold_eur_per_g, silver_eur_per_g):
-              # Range volutamente larghi.
-              # Servono a bloccare errori grossolani di inversione cambio/API.
               if not Decimal("10") <= gold_eur_per_g <= Decimal("300"):
                   fail(f"Gold EUR/g value looks abnormal: {gold_eur_per_g}")
 
@@ -218,6 +210,38 @@ jobs:
                   "Content-Type": "application/json",
                   "User-Agent": "spot-metal-prices-updater",
               }
+
+
+          def http_json_request(url, method="GET", headers=None, body=None):
+              request = urllib.request.Request(
+                  url=url,
+                  method=method,
+                  headers=headers or {},
+                  data=body,
+              )
+
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      raw = response.read().decode("utf-8")
+                      if not raw:
+                          return None, response.status
+                      return json.loads(raw), response.status
+
+              except urllib.error.HTTPError as error:
+                  raw = error.read().decode("utf-8", errors="replace")
+                  try:
+                      parsed = json.loads(raw)
+                  except json.JSONDecodeError:
+                      parsed = raw
+
+                  return {
+                      "_http_error": True,
+                      "status": error.code,
+                      "body": parsed,
+                  }, error.code
+
+              except urllib.error.URLError as error:
+                  fail(f"Network error during GitHub API request: {error}")
 
 
           def get_existing_file():
@@ -258,7 +282,6 @@ jobs:
                   "branch": DEFAULT_BRANCH,
               }
 
-              # GitHub richiede lo sha quando si aggiorna un file già esistente.
               if sha:
                   payload["sha"] = sha
 
