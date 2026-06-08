@@ -1,0 +1,204 @@
+name: Update Spot Metal Prices
+
+permissions:
+  contents: write
+
+on:
+  schedule:
+    # Ogni 30 minuti, ai minuti 7 e 37 UTC
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: update-spot-metal-prices
+  cancel-in-progress: true
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Fetch API and update spot CSV
+        env:
+          API_KEY: ${{ secrets.METAL_PRICE_API_KEY }}
+          PYTHONUNBUFFERED: "1"
+          TZ: "UTC"
+        run: |
+          python << 'PYTHON_SCRIPT'
+          import csv
+          import os
+          import sys
+          from datetime import datetime, timezone
+          from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+          from pathlib import Path
+
+          import requests
+
+
+          API_KEY = os.environ.get("API_KEY")
+          BASE_URL = "https://api.metalpriceapi.com/v1/latest"
+
+          OUTPUT_CSV = Path("spot_metal_prices.csv")
+          OZ_TO_G = Decimal("31.1035")
+
+          CSV_FIELDS = [
+              "datetime",
+              "gold_eur_per_g",
+              "silver_eur_per_g",
+          ]
+
+
+          def fail(message):
+              print(f"ERROR: {message}", file=sys.stderr)
+              sys.exit(1)
+
+
+          def to_decimal(value, label):
+              try:
+                  return Decimal(str(value))
+              except (InvalidOperation, TypeError):
+                  fail(f"Invalid decimal value for {label}: {value!r}")
+
+
+          def fetch_rates():
+              if not API_KEY:
+                  fail("METAL_PRICE_API_KEY secret is missing or empty.")
+
+              params = {
+                  "api_key": API_KEY,
+                  "base": "USD",
+                  "currencies": "EUR,XAU,XAG",
+              }
+
+              print("Calling Metal Price API...")
+              response = requests.get(BASE_URL, params=params, timeout=20)
+
+              print(f"HTTP status: {response.status_code}")
+
+              if response.status_code != 200:
+                  print("API response body:")
+                  print(response.text[:1000])
+                  response.raise_for_status()
+
+              data = response.json()
+
+              print("API success:", data.get("success"))
+              print("API base:", data.get("base"))
+
+              if not data.get("success"):
+                  print("API response body:")
+                  print(data)
+                  fail("Metal Price API returned success=false.")
+
+              rates = data.get("rates")
+              if not isinstance(rates, dict):
+                  print("API response body:")
+                  print(data)
+                  fail("API response does not contain a valid rates object.")
+
+              for key in ["EUR", "XAU", "XAG"]:
+                  if key not in rates:
+                      print("Available rate keys:", ", ".join(sorted(rates.keys())))
+                      fail(f"Missing {key} in API response.")
+
+              print("Raw EUR:", rates["EUR"])
+              print("Raw XAU:", rates["XAU"])
+              print("Raw XAG:", rates["XAG"])
+
+              return rates
+
+
+          def metal_eur_per_gram(rates, metal_code):
+              eur_per_usd = to_decimal(rates["EUR"], "EUR")
+              metal_oz_per_usd = to_decimal(rates[metal_code], metal_code)
+
+              if eur_per_usd <= 0:
+                  fail("EUR rate must be greater than zero.")
+
+              if metal_oz_per_usd <= 0:
+                  fail(f"{metal_code} rate must be greater than zero.")
+
+              usd_per_oz = Decimal("1") / metal_oz_per_usd
+              eur_per_oz = usd_per_oz * eur_per_usd
+              eur_per_g = (eur_per_oz / OZ_TO_G).quantize(
+                  Decimal("0.0001"),
+                  rounding=ROUND_HALF_UP,
+              )
+
+              print(f"{metal_code} USD/oz: {usd_per_oz}")
+              print(f"{metal_code} EUR/oz: {eur_per_oz}")
+              print(f"{metal_code} EUR/g: {eur_per_g}")
+
+              return eur_per_g
+
+
+          def write_spot_csv(datetime_str, gold_value, silver_value):
+              with OUTPUT_CSV.open("w", encoding="utf-8", newline="") as file:
+                  writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
+                  writer.writeheader()
+                  writer.writerow({
+                      "datetime": datetime_str,
+                      "gold_eur_per_g": str(gold_value),
+                      "silver_eur_per_g": str(silver_value),
+                  })
+
+
+          def main():
+              rates = fetch_rates()
+
+              now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+              datetime_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+              gold_eur_per_g = metal_eur_per_gram(rates, "XAU")
+              silver_eur_per_g = metal_eur_per_gram(rates, "XAG")
+
+              print(f"Datetime UTC: {datetime_str}")
+              print(f"Final gold EUR/g: {gold_eur_per_g}")
+              print(f"Final silver EUR/g: {silver_eur_per_g}")
+
+              write_spot_csv(datetime_str, gold_eur_per_g, silver_eur_per_g)
+
+              print(f"{OUTPUT_CSV} updated successfully.")
+
+
+          if __name__ == "__main__":
+              main()
+          PYTHON_SCRIPT
+
+      - name: Show generated CSV
+        run: |
+          echo "spot_metal_prices.csv:"
+          cat spot_metal_prices.csv || true
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add spot_metal_prices.csv
+
+          echo "Staged diff:"
+          git diff --cached -- spot_metal_prices.csv || true
+
+          if git diff --cached --quiet; then
+            echo "No CSV changes to commit."
+          else
+            git commit -m "Update spot metal prices"
+            git push
+          fi
