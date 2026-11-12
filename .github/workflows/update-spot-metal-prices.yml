@@ -5,10 +5,12 @@ permissions:
 
 on:
   schedule:
-    # Ogni 30 minuti.
-    # GitHub usa UTC, ma i minuti :07 e :37 sono uguali anche in Italia.
-    # L'orario scritto nel CSV viene convertito in Europe/Rome da Python.
-    - cron: "7,37 * * * *"
+    - cron: "50 8 * * *"
+      timezone: "Europe/Rome"
+    - cron: "40 15 * * *"
+      timezone: "Europe/Rome"
+    - cron: "0 18 * * *"
+      timezone: "Europe/Rome"
   workflow_dispatch:
 
 concurrency:
